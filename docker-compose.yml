@@ -1,0 +1,225 @@
+version: "3.8"
+
+x-plane-env: &plane-env
+  env_file: .env
+  environment:
+    SECRET_KEY: ${SECRET_KEY}
+    WEB_URL: ${WEB_URL}
+    DATABASE_URL: postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}
+    REDIS_URL: redis://${REDIS_HOST}:${REDIS_PORT}/
+    AMQP_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@${RABBITMQ_HOST}:${RABBITMQ_PORT}/
+    AWS_REGION: ${AWS_REGION}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT_URL}
+    AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME}
+    EMAIL_HOST: ${EMAIL_HOST}
+    EMAIL_PORT: ${EMAIL_PORT}
+    EMAIL_HOST_USER: ${EMAIL_HOST_USER}
+    EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD}
+    EMAIL_USE_TLS: ${EMAIL_USE_TLS}
+    DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL}
+
+networks:
+  plane-net:
+    driver: bridge
+
+volumes:
+  plane-db-data:
+  plane-redis-data:
+  plane-minio-data:
+  plane-rabbitmq-data:
+  plane-backups:
+  caddy-data:
+  caddy-config:
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────
+
+  plane-db:
+    image: postgres:15-alpine
+    container_name: plane-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE}
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+    volumes:
+      - plane-db-data:/var/lib/postgresql/data
+    networks: [plane-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER} -d ${PGDATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  plane-redis:
+    image: valkey/valkey:7-alpine
+    container_name: plane-redis
+    restart: unless-stopped
+    volumes:
+      - plane-redis-data:/data
+    networks: [plane-net]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      retries: 5
+
+  plane-minio:
+    image: minio/minio:latest
+    container_name: plane-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - plane-minio-data:/data
+    networks: [plane-net]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      retries: 3
+
+  plane-rabbitmq:
+    image: rabbitmq:3.13-alpine
+    container_name: plane-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - plane-rabbitmq-data:/var/lib/rabbitmq
+    networks: [plane-net]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      retries: 5
+
+  # ── Plane Application ───────────────────────────────────────────────
+
+  plane-migrator:
+    image: makeplane/plane-backend:stable
+    container_name: plane-migrator
+    command: ./bin/migrate.sh
+    <<: *plane-env
+    depends_on:
+      plane-db:
+        condition: service_healthy
+    networks: [plane-net]
+    restart: "no"
+
+  plane-api:
+    image: makeplane/plane-backend:stable
+    container_name: plane-api
+    command: ./bin/takeoff
+    restart: unless-stopped
+    <<: *plane-env
+    depends_on:
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+      plane-migrator:
+        condition: service_completed_successfully
+    networks: [plane-net]
+
+  plane-worker:
+    image: makeplane/plane-backend:stable
+    container_name: plane-worker
+    command: ./bin/worker
+    restart: unless-stopped
+    <<: *plane-env
+    depends_on:
+      plane-api:
+        condition: service_started
+    networks: [plane-net]
+
+  plane-beat:
+    image: makeplane/plane-backend:stable
+    container_name: plane-beat
+    command: ./bin/beat
+    restart: unless-stopped
+    <<: *plane-env
+    depends_on:
+      plane-api:
+        condition: service_started
+    networks: [plane-net]
+
+  plane-web:
+    image: makeplane/plane-frontend:stable
+    container_name: plane-web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: https://${PLANE_DOMAIN}
+      NEXT_PUBLIC_GOOGLE_CLIENTID: "0"
+      NEXT_PUBLIC_GITHUB_ID: "0"
+      NEXT_PUBLIC_ENABLE_SENTRY: "0"
+    depends_on:
+      plane-api:
+        condition: service_started
+    networks: [plane-net]
+
+  plane-live:
+    image: makeplane/plane-live:stable
+    container_name: plane-live
+    restart: unless-stopped
+    <<: *plane-env
+    depends_on:
+      plane-api:
+        condition: service_started
+    networks: [plane-net]
+
+  plane-proxy:
+    image: makeplane/plane-proxy:stable
+    container_name: plane-proxy
+    restart: unless-stopped
+    environment:
+      NGINX_PORT: ${LISTEN_HTTP_PORT:-8080}
+      FILE_SIZE_LIMIT: 5m
+    ports:
+      - "127.0.0.1:${LISTEN_HTTP_PORT:-8080}:${LISTEN_HTTP_PORT:-8080}"
+    depends_on:
+      - plane-web
+      - plane-api
+      - plane-live
+    networks: [plane-net]
+
+  # ── Reverse Proxy ───────────────────────────────────────────────────
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: plane-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [plane-net]
+    depends_on:
+      - plane-proxy
+
+  # ── Backup ──────────────────────────────────────────────────────────
+
+  plane-backup:
+    build: ./backup
+    container_name: plane-backup
+    restart: unless-stopped
+    environment:
+      PGHOST: ${PGHOST}
+      PGPORT: ${PGPORT}
+      PGDATABASE: ${PGDATABASE}
+      PGUSER: ${PGUSER}
+      PGPASSWORD: ${PGPASSWORD}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - plane-backups:/backups
+    depends_on:
+      plane-db:
+        condition: service_healthy
+    networks: [plane-net]
